@@ -2,7 +2,7 @@
 
 use std::collections::VecDeque;
 
-use crate::{types::{LogicPortPins, Metadata}};
+use crate::types::{LogicPortPins, Metadata};
 
 const ADC_MULTIPLIER: f32 = 1.8 / 163840.;
 const SPIKE_FILTER_ALPHA: f32 = 0.18;
@@ -97,10 +97,7 @@ impl MeasurementAccumulator {
                 self.state.expected_counter.replace(counter);
             }
 
-            buf.push_back(Measurement {
-                micro_amps,
-                pins,
-            })
+            buf.push_back(Measurement { micro_amps, pins })
         }
         self.buf.drain(..end);
         samples_missed
@@ -119,7 +116,7 @@ fn get_adc_result(
         (adc_val as f32 - modifiers.o[range]) * (ADC_MULTIPLIER / modifiers.r[range]);
     let mut adc = modifiers.ug[range]
         * (result_without_gain * (modifiers.gs[range] * result_without_gain + modifiers.gi[range])
-            + (modifiers.s[range] * (f32::from(metadata.vdd) / 1000.) + modifiers.i[range]));
+            + (modifiers.s[range] * (300f32 / 1000.) + modifiers.i[range]));
 
     let prev_rolling_avg_4 = state.rolling_avg_4;
     let prev_rolling_avg = state.rolling_avg;
@@ -164,7 +161,6 @@ fn get_adc_result(
     state.prev_range = Some(range);
     adc
 }
-
 
 /// Indicates whether a set of [Measurement]s matched
 #[derive(Debug)]
@@ -211,6 +207,9 @@ impl<I: Iterator<Item = Measurement>> MeasurementIterExt for I {
             return MeasurementMatch::NoMatch;
         }
 
+        if missed != 0 {
+            log::info!("missed {}", missed);
+        }
         // Set combined pin high if and only if more than half
         // of the measurements indicate the pin was high
         let mut pins = [false; 8];
@@ -220,6 +219,7 @@ impl<I: Iterator<Item = Measurement>> MeasurementIterExt for I {
             .filter(|(_, p)| *p > count / 2)
             .for_each(|(i, _)| pins[i] = true);
         let avg = sum / (count - missed) as f32;
+        log::info!("count {}", count);
 
         MeasurementMatch::Match(Measurement {
             micro_amps: avg,
@@ -240,7 +240,7 @@ impl<I: Iterator<Item = Measurement>> MeasurementIterExt for I {
 }
 
 const fn generate_mask(bits: u32, pos: u32) -> u32 {
-    (2u32.pow(bits as u32) - 1) << pos
+    ((1 << bits) - 1) << pos
 }
 
 macro_rules! masked_value {

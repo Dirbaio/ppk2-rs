@@ -1,10 +1,12 @@
 #![doc = include_str!("../README.md")]
 #![deny(missing_docs)]
 
+use log::info;
 use measurement::{MeasurementAccumulator, MeasurementIterExt, MeasurementMatch};
 use serialport::{ClearBuffer::Input, FlowControl, SerialPort};
 use std::str::Utf8Error;
 use std::sync::mpsc::{self, Receiver, SendError, TryRecvError};
+use std::time::Instant;
 use std::{
     borrow::Cow,
     collections::VecDeque,
@@ -21,8 +23,6 @@ use crate::cmd::Command;
 pub mod cmd;
 pub mod measurement;
 pub mod types;
-
-const SPS_MAX: usize = 90_000;
 
 #[derive(Error, Debug)]
 /// PPK2 communication or data parsing error.
@@ -66,12 +66,12 @@ impl Ppk2 {
             .open()?;
 
         if let Err(e) = port.clear(serialport::ClearBuffer::All) {
-            tracing::warn!("failed to clear buffers: {:?}", e);
+            log::warn!("failed to clear buffers: {:?}", e);
         }
 
         // Required to work on Windows.
         if let Err(e) = port.write_data_terminal_ready(true) {
-            tracing::warn!("failed to set DTR: {:?}", e);
+            log::warn!("failed to set DTR: {:?}", e);
         }
 
         let mut ppk2 = Self {
@@ -80,6 +80,7 @@ impl Ppk2 {
         };
 
         ppk2.metadata = ppk2.get_metadata()?;
+        info!("meta {:?}", ppk2.metadata);
         ppk2.set_power_mode(mode)?;
         Ok(ppk2)
     }
@@ -87,6 +88,7 @@ impl Ppk2 {
     /// Send a raw command and return the result.
     pub fn send_command(&mut self, command: Command) -> Result<Vec<u8>> {
         self.port.write_all(&Vec::from_iter(command.bytes()))?;
+        self.port.flush()?;
         // Doesn't allocate if expected response length is 0
         let mut response = Vec::with_capacity(command.expected_response_len());
         let mut buf = [0u8; 128];
@@ -117,96 +119,34 @@ impl Ppk2 {
 
     /// Start measurements. Returns a tuple of:
     /// - [Ppk2<Measuring>],
-    /// - [Receiver] of [measurement::MeasurementMatch], and
-    /// - A closure that can be called to stop the measurement parsing pipeline and return the
-    /// device.
-    pub fn start_measurement(
-        self,
-        sps: usize,
-    ) -> Result<(Receiver<MeasurementMatch>, impl FnOnce() -> Result<Self>)> {
-        self.start_measurement_matching(LogicPortPins::default(), sps)
-    }
-
-    /// Start measurements. Returns a tuple of:
-    /// - [Ppk2<Measuring>],
     /// - [Receiver] of [measurement::Result], and
     /// - A closure that can be called to stop the measurement parsing pipeline and return the
     /// device.
-    pub fn start_measurement_matching(
-        mut self,
-        pins: LogicPortPins,
-        sps: usize,
-    ) -> Result<(Receiver<MeasurementMatch>, impl FnOnce() -> Result<Self>)> {
-        // Stuff needed to communicate with the main thread
-        // ready allows main thread to signal worker when serial input buf is cleared.
-        let ready = Arc::new((Mutex::new(false), Condvar::new()));
-        // This channel is for sending measurements to the main thread.
-        let (meas_tx, meas_rx) = mpsc::channel::<MeasurementMatch>();
-        // This channel allows the main thread to notify that the worker thread can stop
-        // parsing data.
-        let (sig_tx, sig_rx) = mpsc::channel::<()>();
-
-        let task_ready = ready.clone();
-        let mut port = self.port.try_clone()?;
+    pub fn measure(&mut self, pins: LogicPortPins, dur: Duration) -> Result<MeasurementMatch> {
         let metadata = self.metadata.clone();
 
-        let t = thread::spawn(move || {
-            let r = || -> Result<()> {
-                // Create an accumulator with the current device metadata
-                let mut accumulator = MeasurementAccumulator::new(metadata);
-                // First wait for main thread to clear
-                // serial port input buffer
-                let (lock, cvar) = &*task_ready;
-                let _l = cvar
-                    .wait_while(lock.lock().unwrap(), |ready| !*ready)
-                    .unwrap();
-
-                let mut buf = [0u8; 1024];
-                let mut measurement_buf = VecDeque::with_capacity(SPS_MAX);
-                let mut missed = 0;
-                loop {
-                    // Check whether the main thread has signaled
-                    // us to stop
-                    match sig_rx.try_recv() {
-                        Ok(_) => return Ok(()),
-                        Err(TryRecvError::Empty) => {}
-                        Err(e) => return Err(e.into()),
-                    }
-
-                    // Now we read chunks and feed them to the accumulator
-                    let n = port.read(&mut buf)?;
-                    missed += accumulator.feed_into(&buf[..n], &mut measurement_buf);
-                    let len = measurement_buf.len();
-                    if len >= SPS_MAX / sps {
-                        let measurement = measurement_buf.drain(..).combine_matching(missed, pins);
-                        meas_tx.send(measurement)?;
-                        missed = 0;
-                    }
-                }
-            };
-            let res = r();
-            if let Err(e) = &res {
-                tracing::error!("Error fetching measurements: {:?}", e);
-            };
-            res
-        });
         self.port.clear(Input)?;
-
-        let (lock, cvar) = &*ready;
-        let mut ready = lock.lock().unwrap();
-        *ready = true;
-        cvar.notify_all();
-
         self.send_command(Command::AverageStart)?;
 
-        let stop = move || {
-            sig_tx.send(())?;
-            t.join().expect("Data receive thread panicked")?;
-            self.send_command(Command::AverageStop)?;
-            Ok(self)
-        };
+        // Create an accumulator with the current device metadata
+        let mut accumulator = MeasurementAccumulator::new(metadata);
 
-        Ok((meas_rx, stop))
+        let mut buf = [0u8; 1024];
+        let mut measurement_buf = VecDeque::new();
+
+        let end = Instant::now() + dur;
+        while Instant::now() < end {
+            // Now we read chunks and feed them to the accumulator
+            let n = self.port.read(&mut buf)?;
+            let missed = accumulator.feed_into(&buf[..n], &mut measurement_buf);
+            if missed != 0 {
+                panic!("missed samples");
+            }
+        }
+
+        let measurement = measurement_buf.drain(..).combine_matching(0, pins);
+        self.send_command(Command::AverageStop)?;
+        Ok(measurement)
     }
 
     /// Reset the device, making the device unusable.
