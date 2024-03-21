@@ -1,7 +1,7 @@
 #![doc = include_str!("../README.md")]
 #![deny(missing_docs)]
 
-use log::info;
+use log::{info, warn};
 use measurement::{MeasurementAccumulator, MeasurementIterExt, MeasurementMatch};
 use serialport::{ClearBuffer::Input, FlowControl, SerialPort};
 use std::str::Utf8Error;
@@ -140,7 +140,7 @@ impl Ppk2 {
             let n = self.port.read(&mut buf)?;
             let missed = accumulator.feed_into(&buf[..n], &mut measurement_buf);
             if missed != 0 {
-                panic!("missed samples");
+                warn!("missed samples: {}", missed);
             }
         }
 
